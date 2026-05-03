@@ -1,0 +1,71 @@
+[workspace]
+
+[package]
+name = "overlay-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Composited WebView2 overlay engine on top of asdf-overlay. Handles DLL injection, frame composition, input routing, and hover-mode hit-testing, exposing a single ergonomic Rust API for embedding overlay UIs into running games."
+repository = "https://github.com/judehek/overlay-engine"
+homepage = "https://github.com/judehek/overlay-engine"
+readme = "README.md"
+keywords = ["overlay", "webview2", "game", "windows", "dll-injection"]
+categories = ["graphics", "gui", "os::windows-apis"]
+
+[features]
+# Off by default; turn on if you want full asdf-overlay backend access.
+asdf-overlay-internal = []
+
+[dependencies]
+# `asdf-overlay-client` is consumed via path. When this crate is checked out
+# inside the ascent monorepo it resolves through the sibling submodule under
+# `apps/desktop/src-tauri/open-source/asdf-overlay/`. For standalone clones,
+# check out `judehek/asdf-overlay` as a sibling directory at `../asdf-overlay`
+# and the path resolves the same way (see README).
+asdf-overlay-client = { path = "../asdf-overlay/crates/client" }
+tokio = { version = "1.36", features = ["sync", "rt", "macros", "time", "net"] }
+anyhow = "1.0"
+thiserror = "2.0"
+
+# `parking_lot` is what asdf-overlay uses internally for its mutex types so we
+# stay consistent for any state we share across the engine's threads.
+parking_lot = "0.12"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.39"
+windows-numerics = "0.3"
+windows = { version = "0.62", features = [
+    # Process discovery + DLL resolution
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+
+    # GDI -- needed for RegisterClassW / WNDCLASSW in windows-rs 0.62.
+    "Win32_Graphics_Gdi",
+
+    # Graphics / D3D11 / DXGI for shared textures
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+
+    # WinRT interop for DispatcherQueue, DirectComposition, Graphics.Capture
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+
+    # WinRT projections
+    "Foundation",
+    "Foundation_Numerics",
+    "System",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "UI",
+    "UI_Composition",
+] }
