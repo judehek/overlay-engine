@@ -32,6 +32,16 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN, COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
     COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
 };
+
+// Bit values for COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS, mirroring Win32's
+// MK_* flags. Defined locally rather than imported because the
+// `webview2-com` re-export path varies between versions and inlining
+// these keeps the dispatch module self-contained.
+const VK_LEFT_BUTTON: i32 = 0x0001;
+const VK_RIGHT_BUTTON: i32 = 0x0002;
+const VK_MIDDLE_BUTTON: i32 = 0x0010;
+const VK_X_BUTTON1: i32 = 0x0020;
+const VK_X_BUTTON2: i32 = 0x0040;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,6 +59,18 @@ thread_local! {
     /// doesn't implement `Copy + Default` ergonomically across windows
     /// crate versions).
     static CHROMIUM_HWND: Cell<isize> = const { Cell::new(0) };
+
+    /// Currently-held mouse buttons as a `COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS`
+    /// bitmask. Updated on each Pressed/Released cursor action and
+    /// reported on every subsequent SendMouseInput call.
+    ///
+    /// Required because Chromium treats `virtual_keys` like Win32's
+    /// `WM_MOUSEMOVE` `wParam` (`MK_LBUTTON`, etc.): if a MOVE during
+    /// an in-progress drag arrives with `virtual_keys=0`, Chromium
+    /// synthesises an implicit button-up and the drag is cancelled --
+    /// breaking HTML5 `<video>` timeline scrubbing, range slider drags
+    /// and HTML5 drag-and-drop.
+    static HELD_MOUSE_BUTTONS: Cell<i32> = const { Cell::new(0) };
 }
 
 /// Translate a single asdf-overlay input event and push it into WebView2.
@@ -226,12 +248,15 @@ fn chromium_widget_hwnd(parent: HWND) -> Option<HWND> {
 /// pixels; the overlay is anchored at (0,0) with the same size as the
 /// WebView2 visual, so they're directly usable as webview pixel coords.
 ///
-/// `virtual_keys` encodes modifier/button state. WebView2 mostly uses it
-/// for chorded clicks (e.g. ctrl+click for new tab). We report an empty
-/// set because asdf-overlay doesn't give us current modifier state on
-/// the cursor payload; the page will still see mouse events, just
-/// without modifiers. Once keyboard forwarding lands we can track
-/// modifier state locally and plumb it in here.
+/// `virtual_keys` encodes modifier/button state. WebView2 mostly uses
+/// it for chorded clicks (e.g. ctrl+click for new tab) and -- crucially
+/// -- to validate "button is currently held" during MOVE events while a
+/// drag is in progress. We track the held-mouse-button mask in
+/// [`HELD_MOUSE_BUTTONS`] across calls and surface it here for every
+/// event so HTML5 timeline drags and range-slider scrubs work.
+/// Modifier keys (Ctrl/Shift/Alt) aren't plumbed yet -- asdf-overlay
+/// doesn't include them on the cursor payload; we'd need to track
+/// keyboard state locally to add them.
 fn dispatch_cursor(
     controller: &ICoreWebView2CompositionController,
     cursor: &CursorInput,
@@ -254,7 +279,31 @@ fn dispatch_cursor(
             y: cursor.client.y,
         }
     };
-    let virtual_keys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS(0);
+
+    // Update the held-button mask BEFORE composing virtual_keys for
+    // this event. Win32 convention is that the mask reflects the state
+    // AFTER the event (WM_LBUTTONDOWN -> MK_LBUTTON set, WM_LBUTTONUP
+    // -> MK_LBUTTON clear), and Chromium follows the same convention.
+    if let CursorEvent::Action { state, action } = &cursor.event {
+        let bit = match action {
+            CursorAction::Left => VK_LEFT_BUTTON,
+            CursorAction::Right => VK_RIGHT_BUTTON,
+            CursorAction::Middle => VK_MIDDLE_BUTTON,
+            CursorAction::Back => VK_X_BUTTON1,
+            CursorAction::Forward => VK_X_BUTTON2,
+        };
+        HELD_MOUSE_BUTTONS.with(|m| {
+            let mut held = m.get();
+            if matches!(state, CursorInputState::Pressed { .. }) {
+                held |= bit;
+            } else {
+                held &= !bit;
+            }
+            m.set(held);
+        });
+    }
+    let virtual_keys =
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS(HELD_MOUSE_BUTTONS.with(|m| m.get()));
 
     let (kind, mouse_data) = match &cursor.event {
         CursorEvent::Move | CursorEvent::Enter | CursorEvent::Leave => {

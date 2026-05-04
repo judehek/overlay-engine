@@ -11,14 +11,17 @@
 use std::sync::mpsc::channel;
 
 use anyhow::{anyhow, Context, Result};
+use tokio::sync::mpsc as tokio_mpsc;
 use webview2_com::{
-    CreateCoreWebView2CompositionControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, Microsoft::Web::WebView2::Win32::{
-        CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2CompositionController,
+    take_pwstr, CreateCoreWebView2CompositionControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2CompositionController,
         ICoreWebView2Environment, ICoreWebView2Environment3,
     },
+    WebMessageReceivedEventHandler,
 };
-use windows::core::{Interface, PCWSTR};
+use windows::core::{Interface, PCWSTR, PWSTR};
 use windows::Win32::Foundation::HWND;
 
 /// Block on environment creation; returns the environment once ready.
@@ -82,4 +85,37 @@ pub(crate) fn create_composition_controller(
     .map_err(|e| anyhow!("wait_for_async_operation (composition): {e:?}"))?;
     rx.recv()
         .map_err(|_| anyhow!("composition controller handler never fired"))?
+}
+
+/// Subscribe to `window.chrome.webview.postMessage(text)` calls from the
+/// page running inside `webview`. Each message is decoded to UTF-8 and
+/// forwarded to `tx`.
+///
+/// Registered once on attach. We never `remove_WebMessageReceived`: the
+/// webview is torn down with the engine, which drops its handlers along
+/// with it.
+pub(crate) fn register_web_message_handler(
+    webview: &ICoreWebView2,
+    tx: tokio_mpsc::UnboundedSender<String>,
+) -> Result<()> {
+    let handler = WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut raw: PWSTR = PWSTR::null();
+        // `TryGetWebMessageAsString` returns a non-success HRESULT for
+        // structured-clone payloads. We skip those.
+        if unsafe { args.TryGetWebMessageAsString(&mut raw) }.is_err() || raw.is_null() {
+            return Ok(());
+        }
+        // `take_pwstr` copies into a String and CoTaskMemFrees the
+        // original buffer for us.
+        let text = take_pwstr(raw);
+        let _ = tx.send(text);
+        Ok(())
+    }));
+    let mut token: i64 = 0;
+    unsafe { webview.add_WebMessageReceived(&handler, &mut token) }
+        .context("add_WebMessageReceived")?;
+    Ok(())
 }

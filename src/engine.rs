@@ -158,6 +158,29 @@ impl OverlayEngine {
         reply_rx.await.map_err(|_| Error::AlreadyDetached)?
     }
 
+    /// Post `text` into the WebView2 page as
+    /// `window.chrome.webview.message`. Pair with the page-side
+    /// `window.chrome.webview.addEventListener('message', ...)` to
+    /// drive UI state from the host.
+    ///
+    /// Returns once the message has been queued onto the WebView2 STA
+    /// thread; delivery to the page is asynchronous and not reported
+    /// back via [`EngineEvent`]. The page itself can ack via
+    /// `window.chrome.webview.postMessage(...)` if needed (delivered
+    /// to the host as [`EngineEvent::WebMessage`]).
+    pub async fn post_web_message(&self, text: impl Into<String>) -> Result<()> {
+        let text = text.into();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(EngineRequest::PostWebMessage {
+                text,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Error::AlreadyDetached)?;
+        reply_rx.await.map_err(|_| Error::AlreadyDetached)?
+    }
+
     /// Tear down the overlay cleanly. Returns once the WebView2 thread
     /// has joined, the IPC pipe has been closed, and the safe-inject
     /// hook has been released. After this, the [`EngineEvent`] channel
@@ -186,6 +209,10 @@ impl OverlayEngine {
 enum EngineRequest {
     SetHitRegions {
         regions: Vec<HitRegion>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PostWebMessage {
+        text: String,
         reply: oneshot::Sender<Result<()>>,
     },
     Detach {
@@ -262,10 +289,15 @@ async fn engine_loop(mut state: LoopState) {
         return;
     }
 
-    // Default: the entire surface is interactable, matching the old
-    // `BlockCursorInOverlay` behavior. Once `set_hit_regions` is
-    // called, this is replaced with the user's own regions.
-    state.hit_regions = vec![HitRegion::full(state.surface_size)];
+    // Default: nothing is interactable. The DLL was configured with
+    // `BlockCursorInOverlay { enabled: false }` in
+    // `configure_window_hover`, so cursor messages flow straight to
+    // the game until the host opens an interactive panel and calls
+    // `set_hit_regions(&[..])` (which flips both `state.hit_regions`
+    // and the DLL-side flag in lockstep). Defaulting to "full surface
+    // interactive" here would make every click anywhere on the game
+    // window get routed to a WebView2 that has nothing to render.
+    state.hit_regions = Vec::new();
 
     let mut detach_reply: Option<oneshot::Sender<Result<()>>> = None;
     let mut detach_reason = DetachReason::Requested;
@@ -304,11 +336,81 @@ async fn engine_loop(mut state: LoopState) {
                 };
                 match request {
                     EngineRequest::SetHitRegions { regions, reply } => {
-                        state.hit_regions = regions;
-                        let _ = reply.send(Ok(()));
+                        // Mirror the new region set onto the DLL's
+                        // `BlockCursorInOverlay` flag *before* updating
+                        // local state. When transitioning empty -> non-empty
+                        // we need the DLL to start consuming cursor msgs
+                        // before the page paints (otherwise the user sees
+                        // the panel but their click goes through to the
+                        // game beneath it); when going non-empty -> empty
+                        // we want input to start flowing back to the game
+                        // before the next frame.
+                        //
+                        // We flip on any non-empty -> empty transition (or
+                        // vice versa). Same-state requests are a no-op so
+                        // we don't churn the IPC channel when a panel just
+                        // resizes its rect.
+                        let was_blocking = !state.hit_regions.is_empty();
+                        let now_blocking = !regions.is_empty();
+                        let toggle_result = if was_blocking != now_blocking {
+                            ipc::set_block_cursor_in_overlay(
+                                &mut state.conn,
+                                state.window_id,
+                                now_blocking,
+                            )
+                            .await
+                        } else {
+                            Ok(())
+                        };
+                        match toggle_result {
+                            Ok(()) => {
+                                state.hit_regions = regions;
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(err) => {
+                                // Surface the IPC failure to the caller
+                                // and leave `state.hit_regions` untouched
+                                // so the local view stays consistent with
+                                // what the DLL is enforcing.
+                                let _ = reply.send(Err(err));
+                            }
+                        }
+                    }
+                    EngineRequest::PostWebMessage { text, reply } => {
+                        match state.web.post_message_tx.send(text) {
+                            Ok(()) => {
+                                state.web.wake_post_message();
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(Error::Other(anyhow!(
+                                    "post-message channel closed: {err}"
+                                ))));
+                            }
+                        }
                     }
                     EngineRequest::Detach { reply } => {
                         detach_reply = Some(reply);
+                        break;
+                    }
+                }
+            }
+
+            maybe_text = state.web.web_message_rx.recv() => {
+                match maybe_text {
+                    Some(text) => {
+                        let _ = state
+                            .engine_events_tx
+                            .send(EngineEvent::WebMessage(text))
+                            .await;
+                    }
+                    None => {
+                        // STA thread closed its outgoing channel —
+                        // treat as a fatal error so the engine
+                        // detaches cleanly.
+                        detach_reason = DetachReason::Error(
+                            "WebView2 thread closed its web-message channel".into(),
+                        );
                         break;
                     }
                 }

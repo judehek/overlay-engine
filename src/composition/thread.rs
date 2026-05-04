@@ -30,7 +30,8 @@ use anyhow::{Context, Result};
 use asdf_overlay_client::event::input::InputEvent;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    ICoreWebView2CompositionController, ICoreWebView2Controller,
+    COREWEBVIEW2_COLOR, ICoreWebView2, ICoreWebView2CompositionController, ICoreWebView2Controller,
+    ICoreWebView2Controller2,
 };
 use windows::core::{Interface, HSTRING};
 use windows::System::DispatcherQueueController;
@@ -56,6 +57,10 @@ use crate::input::dispatch_input;
 /// Must be `>= WM_APP` and `< WM_APP + 0x4000` per Win32 rules.
 pub(crate) const WM_APP_INPUT: u32 = WM_APP + 1;
 
+/// Custom thread message used to wake the STA thread when the engine
+/// has queued one or more outgoing `PostWebMessageAsString` calls.
+pub(crate) const WM_APP_POST_MSG: u32 = WM_APP + 2;
+
 /// Configuration the engine hands the WebView2 STA thread on spawn.
 pub(crate) struct WebThreadParams {
     /// URL the WebView2 should navigate to immediately after creation.
@@ -75,6 +80,12 @@ pub(crate) struct WebThreadHandle {
     /// Push `InputEvent`s here; pair with `wake_input` to make the
     /// thread drain the queue on its next message-loop iteration.
     pub input_tx: Sender<InputEvent>,
+    /// Push outgoing `PostWebMessageAsString` payloads here; pair with
+    /// `wake_post_message` to make the thread drain the queue.
+    pub post_message_tx: Sender<String>,
+    /// Receiver for incoming `window.chrome.webview.postMessage(text)`
+    /// calls from the page running inside the WebView2.
+    pub web_message_rx: tokio_mpsc::UnboundedReceiver<String>,
     /// Send `()` to ask the thread to exit its message loop. Drop is
     /// not enough — the thread also has to be woken with an empty
     /// `PostThreadMessageW` call.
@@ -89,6 +100,14 @@ impl WebThreadHandle {
     pub fn wake_input(&self) {
         unsafe {
             let _ = PostThreadMessageW(self.thread_id, WM_APP_INPUT, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// PostThreadMessage(WM_APP_POST_MSG) so the thread wakes and
+    /// drains the outgoing-`PostWebMessage` queue.
+    pub fn wake_post_message(&self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_APP_POST_MSG, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -115,6 +134,8 @@ impl WebThreadHandle {
 pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThreadHandle> {
     let (frame_tx, frame_rx) = tokio_mpsc::unbounded_channel::<FrameUpdate>();
     let (input_tx, input_rx) = channel::<InputEvent>();
+    let (post_message_tx, post_message_rx) = channel::<String>();
+    let (web_message_tx, web_message_rx) = tokio_mpsc::unbounded_channel::<String>();
     let (tid_tx, tid_rx) = oneshot::channel::<u32>();
     let (shutdown_tx, shutdown_rx) = channel::<()>();
 
@@ -124,9 +145,16 @@ pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThrea
     let join_handle = thread::Builder::new()
         .name("overlay-engine-webview".into())
         .spawn(move || {
-            if let Err(err) =
-                web_thread_main(url, surface_size, frame_tx, input_rx, tid_tx, shutdown_rx)
-            {
+            if let Err(err) = web_thread_main(
+                url,
+                surface_size,
+                frame_tx,
+                input_rx,
+                post_message_rx,
+                web_message_tx,
+                tid_tx,
+                shutdown_rx,
+            ) {
                 eprintln!("[overlay-engine] webview thread error: {err:?}");
             }
         })
@@ -140,17 +168,22 @@ pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThrea
         thread_id,
         frame_rx,
         input_tx,
+        post_message_tx,
+        web_message_rx,
         shutdown_tx,
         join_handle,
     })
 }
 
 /// Body of the WebView2 STA thread.
+#[allow(clippy::too_many_arguments)]
 fn web_thread_main(
     url: String,
     surface_size: (u32, u32),
     frame_tx: tokio_mpsc::UnboundedSender<FrameUpdate>,
     input_rx: Receiver<InputEvent>,
+    post_message_rx: Receiver<String>,
+    web_message_tx: tokio_mpsc::UnboundedSender<String>,
     tid_tx: oneshot::Sender<u32>,
     shutdown_rx: Receiver<()>,
 ) -> Result<()> {
@@ -237,6 +270,24 @@ fn web_thread_main(
     .context("SetBounds")?;
     unsafe { controller.SetIsVisible(true) }.context("SetIsVisible")?;
 
+    // Make the WebView2 surface transparent. Without this the controller
+    // paints a solid white background behind everything the page draws,
+    // which would land on the game as an opaque rectangle the size of the
+    // staging texture. `COREWEBVIEW2_COLOR { A: 0, .. }` opts the controller
+    // into per-pixel alpha so only what the page draws is composited.
+    let controller2: ICoreWebView2Controller2 = controller
+        .cast()
+        .context("cast ICoreWebView2Controller -> Controller2")?;
+    unsafe {
+        controller2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+            A: 0,
+            R: 0,
+            G: 0,
+            B: 0,
+        })
+    }
+    .context("SetDefaultBackgroundColor(transparent)")?;
+
     // 8. Graphics.Capture pipeline.
     let winrt_device = d3d::wrap_d3d11_as_winrt(&d3d_device)?;
     let capture_item = capture::capture_item_from_visual(&root)?;
@@ -256,6 +307,39 @@ fn web_thread_main(
     // ready to paint, the composition tree starts receiving visuals,
     // which drives FrameArrived events.
     let webview = unsafe { controller.CoreWebView2() }.context("CoreWebView2()")?;
+
+    // Tighten WebView2 settings for the in-game overlay context.
+    //
+    // The default context menu opens as a real top-level Win32 popup,
+    // which yanks foreground focus off the game (looks like an alt-tab
+    // to the user) and can't be rendered correctly inside an exclusive-
+    // fullscreen game in any case. Disable it; pages that want a
+    // context menu can implement their own DOM-based one. Status bar
+    // and "swipe nav gestures" are likewise irrelevant for a panel
+    // overlay and would just waste pixels / generate spurious nav.
+    let settings = unsafe { webview.Settings() }.context("Settings()")?;
+    unsafe { settings.SetAreDefaultContextMenusEnabled(false) }
+        .context("SetAreDefaultContextMenusEnabled(false)")?;
+    unsafe { settings.SetIsStatusBarEnabled(false) }
+        .context("SetIsStatusBarEnabled(false)")?;
+    if let Ok(s4) = settings.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings4>()
+    {
+        // ICoreWebView2Settings4 -> SetIsGeneralAutofillEnabled / SetIsPasswordAutosaveEnabled.
+        // Overlay panels don't have form fields where autofill helps,
+        // and the autofill UI itself is another popup we don't want.
+        let _ = unsafe { s4.SetIsGeneralAutofillEnabled(false) };
+        let _ = unsafe { s4.SetIsPasswordAutosaveEnabled(false) };
+    }
+    if let Ok(s6) = settings.cast::<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings6>()
+    {
+        // Disable horizontal swipe-nav gestures (back/forward) -- they
+        // can fire on touchpad input over the overlay and navigate the
+        // shell page off-target.
+        let _ = unsafe { s6.SetIsSwipeNavigationEnabled(false) };
+    }
+
+    webview::register_web_message_handler(&webview, web_message_tx)
+        .context("register_web_message_handler")?;
     let url_wide = HSTRING::from(url.as_str());
     unsafe { webview.Navigate(&url_wide) }.context("Navigate failed")?;
 
@@ -265,7 +349,9 @@ fn web_thread_main(
     run_message_loop(
         shutdown_rx,
         input_rx,
+        post_message_rx,
         &composition_controller,
+        &webview,
         parent_hwnd,
         surface_size,
     )?;
@@ -290,10 +376,13 @@ fn web_thread_main(
 /// messages with a null HWND so we handle them inline before
 /// `TranslateMessage` / `DispatchMessageW` (which would otherwise be a
 /// no-op for them anyway).
+#[allow(clippy::too_many_arguments)]
 fn run_message_loop(
     shutdown_rx: Receiver<()>,
     input_rx: Receiver<InputEvent>,
+    post_message_rx: Receiver<String>,
     controller: &ICoreWebView2CompositionController,
+    webview: &ICoreWebView2,
     parent_hwnd: windows::Win32::Foundation::HWND,
     surface_size: (u32, u32),
 ) -> Result<()> {
@@ -310,6 +399,15 @@ fn run_message_loop(
             while let Ok(input) = input_rx.try_recv() {
                 if let Err(err) = dispatch_input(controller, parent_hwnd, &input, surface_size) {
                     eprintln!("[overlay-engine] dispatch_input failed: {err:?}");
+                }
+            }
+            continue;
+        }
+        if msg.message == WM_APP_POST_MSG && msg.hwnd.0.is_null() {
+            while let Ok(text) = post_message_rx.try_recv() {
+                let payload = HSTRING::from(text.as_str());
+                if let Err(err) = unsafe { webview.PostWebMessageAsString(&payload) } {
+                    eprintln!("[overlay-engine] PostWebMessageAsString failed: {err:?}");
                 }
             }
             continue;

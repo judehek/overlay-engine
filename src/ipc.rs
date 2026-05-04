@@ -134,13 +134,17 @@ async fn wait_for_pipe(
 ///
 /// * Anchor + position at the top-left so the WebView2 surface coords
 ///   match the game-window client coords directly.
-/// * Cursor input listening on.
-/// * `BlockCursorInOverlay` enabled — the DLL only consumes cursor
-///   events while the cursor is over the overlay rect or during a drag
-///   started inside it (goverlay-style hit-testing).
-///
-/// Keyboard input is intentionally left off; the engine forwards
-/// keyboard separately once full keyboard support lands.
+/// * Cursor + keyboard input listening on so the engine sees every
+///   event the wndproc / queue filter sees.
+/// * `BlockCursorInOverlay` left **off** initially — the DLL only
+///   knows about a single overlay rect (= the staging texture size),
+///   which is sized to the full primary monitor for us. Enabling block
+///   mode at attach time would make every click anywhere on the game
+///   window get consumed even when no interactive panel is up. Instead
+///   the engine flips this on/off via [`set_block_cursor_in_overlay`]
+///   in lockstep with `set_hit_regions`: empty regions ⇒ off (game
+///   gets every input), non-empty ⇒ on (so the WebView2 panel can
+///   actually receive the click).
 pub(crate) async fn configure_window_hover(conn: &mut IpcClientConn, id: u32) -> Result<()> {
     let mut window = conn.window(id);
     window
@@ -171,7 +175,33 @@ pub(crate) async fn configure_window_hover(conn: &mut IpcClientConn, id: u32) ->
         .await
         .map_err(Error::Ipc)?;
     window
-        .request(BlockCursorInOverlay { enabled: true })
+        .request(BlockCursorInOverlay { enabled: false })
+        .await
+        .map_err(Error::Ipc)?;
+    Ok(())
+}
+
+/// Toggle the DLL-side `BlockCursorInOverlay` flag for the active
+/// game window. The engine drives this from `set_hit_regions`: a
+/// non-empty region set means "we want the WebView2 to receive the
+/// click (so the DLL must consume it from the game)", an empty set
+/// means "the overlay is purely visual right now (let everything
+/// through)".
+///
+/// Note that the DLL's notion of "the overlay rect" is the staging
+/// texture size + `SetPosition`, *not* our per-region rects. While
+/// blocking is on, the DLL consumes cursor messages anywhere inside
+/// that rect — which for us is the whole primary monitor. That's the
+/// known coarse-grained limitation we accept until asdf-overlay grows
+/// per-rect hit-testing; the alternative (BCO permanently on) makes
+/// the game completely uninteractable whenever the overlay is loaded.
+pub(crate) async fn set_block_cursor_in_overlay(
+    conn: &mut IpcClientConn,
+    id: u32,
+    enabled: bool,
+) -> Result<()> {
+    conn.window(id)
+        .request(BlockCursorInOverlay { enabled })
         .await
         .map_err(Error::Ipc)?;
     Ok(())

@@ -52,6 +52,15 @@ pub enum EngineEvent {
     /// (composition, IPC, input). The engine keeps running. Fatal
     /// problems show up as `Detached { reason: Error(_) }` instead.
     Warning(String),
+
+    /// A `window.chrome.webview.postMessage(text)` call from the page
+    /// inside the WebView2 reached the engine. `text` is whatever the
+    /// page sent — JSON-encoded by convention but the engine doesn't
+    /// parse it.
+    ///
+    /// Pair with [`crate::OverlayEngine::post_web_message`] for the
+    /// host -> page direction.
+    WebMessage(String),
 }
 
 /// Why an attached engine stopped.
