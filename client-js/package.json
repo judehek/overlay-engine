@@ -1,0 +1,31 @@
+{
+  "name": "@overlay-engine/client",
+  "version": "0.1.0",
+  "description": "Client SDK for code running inside an overlay-engine panel iframe. Wraps window.postMessage with a typed host bridge.",
+  "license": "MIT",
+  "repository": "github:judehek/overlay-engine",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node build.mjs && tsc -p tsconfig.json --emitDeclarationOnly --declaration --outDir dist",
+    "watch": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.0"
+  }
+}

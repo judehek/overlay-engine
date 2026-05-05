@@ -116,6 +116,15 @@ impl OverlayConfigBuilder {
         self
     }
 
+    /// Set an already-built [`DllSource`] directly. Equivalent to
+    /// `dll_dir` / `dll_files` but takes the enum verbatim, useful
+    /// when forwarding a value from a higher-level builder
+    /// (`OverlayBuilder`) that's already validated the source.
+    pub fn dll_source(mut self, source: DllSource) -> Self {
+        self.dll_source = Some(source);
+        self
+    }
+
     /// Optional: page to navigate the WebView2 to on attach.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.initial_url = Some(url.into());

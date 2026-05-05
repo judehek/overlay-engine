@@ -1,2 +1,7 @@
 target/
 Cargo.lock
+
+# JS toolchain artifacts. We deliberately commit `shell/dist/` and
+# `client-js/dist/` so downstream Rust users don't need a Node
+# toolchain to build the crate.
+node_modules/

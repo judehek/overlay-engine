@@ -34,8 +34,17 @@ use crate::ipc;
 /// * The WebView2 composition stack and its render thread.
 /// * The shared D3D11 texture handed to the in-game DLL on every frame.
 ///
-/// Drop semantics: dropping the engine *initiates* shutdown but does not
-/// block on it. For deterministic teardown, prefer [`OverlayEngine::detach`].
+/// `Clone` is implemented so several handles can dispatch requests to
+/// the same underlying engine loop (e.g. a panel registry holding one
+/// handle per panel). Cloning is cheap (a `Sender` clone). The loop
+/// itself is owned by exactly one task; whichever clone calls
+/// [`detach`](Self::detach) first triggers shutdown, after which all
+/// other clones return [`Error::AlreadyDetached`] from any operation.
+///
+/// Drop semantics: dropping the last engine handle leaves the engine
+/// loop running until something tells it to detach. For deterministic
+/// teardown, prefer [`OverlayEngine::detach`].
+#[derive(Clone)]
 pub struct OverlayEngine {
     /// Channel into the engine loop. All runtime control flows through
     /// here, so the loop is the single owner of the IPC connection,

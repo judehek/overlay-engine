@@ -60,6 +60,7 @@ pub mod dll;
 pub mod error;
 pub mod event;
 pub mod hit_region;
+pub mod overlay;
 pub mod process;
 
 mod engine;
@@ -78,6 +79,7 @@ pub use engine::OverlayEngine;
 pub use error::{Error, Result};
 pub use event::{DetachReason, EngineEvent, NavigationStatus};
 pub use hit_region::HitRegion;
+pub use overlay::{Overlay, OverlayBuilder, OverlayEvent, Panel, PanelOptions, Rect};
 
 // Re-export the asdf-overlay types we expose in our public surface so
 // consumers don't have to add asdf-overlay-client as a direct dep.

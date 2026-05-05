@@ -1,0 +1,14 @@
+{
+  "name": "@overlay-engine/shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Default shell page embedded in overlay-engine. Hosts panel iframes, aggregates hit regions, routes messages between host and panels.",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5",
+    "typescript": "^5.4.0"
+  }
+}

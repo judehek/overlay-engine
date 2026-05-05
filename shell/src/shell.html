@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="dark light" />
+    <title>overlay-engine shell</title>
+    <style>
+      /* The shell is the entire WebView2 composition surface. The
+         WebView2 controller's default background is set to fully
+         transparent on the Rust side via SetDefaultBackgroundColor;
+         these styles ensure no element introduces an opaque layer. */
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent !important;
+        overflow: hidden;
+      }
+      body {
+        /* Default: nothing in the shell is itself interactive.
+           Panels opt in by being mounted as interactive iframes. */
+        pointer-events: none;
+      }
+      .panel {
+        position: fixed;
+        border: 0;
+        background: transparent;
+        color-scheme: dark light;
+      }
+      .panel--interactive {
+        pointer-events: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <script src="./shell.js"></script>
+  </body>
+</html>
