@@ -294,6 +294,31 @@ impl Overlay {
         engine.detach().await
     }
 
+    /// URL the asset server is bound to, including the path of the
+    /// embedded shell page (`http://127.0.0.1:NNNNN/__overlay/shell.html`).
+    /// Available immediately after [`OverlayBuilder::build`].
+    ///
+    /// Use the URL's `origin` (`http://127.0.0.1:NNNNN`) to construct
+    /// panel URLs against the same `static_dir` ServeDir mount, e.g.
+    /// `format!("{origin}/notifications.html", origin = ...)`.
+    pub fn shell_url(&self) -> &str {
+        self.inner.asset_server.shell_url()
+    }
+
+    /// Convenience: just the origin portion of [`Self::shell_url`]
+    /// (`http://127.0.0.1:NNNNN`, no trailing slash). Returns the same
+    /// string regardless of whether anything is currently attached.
+    pub fn asset_origin(&self) -> String {
+        let shell = self.inner.asset_server.shell_url();
+        // Shell URL is always `http(s)://host[:port]/__overlay/shell.html`.
+        // Strip the path. Works for both ipv4 and ipv6 since axum binds
+        // to `127.0.0.1` for us.
+        match shell.find("/__overlay") {
+            Some(idx) => shell[..idx].to_string(),
+            None => shell.trim_end_matches('/').to_string(),
+        }
+    }
+
     /// Send a host-level "ping" to the shell. The shell replies with
     /// a `pong` — useful as a liveness check during integration tests.
     pub async fn ping_shell(&self) -> Result<()> {
