@@ -38,6 +38,16 @@ interface PanelState {
   customRegions: Rect[] | null;
   /** Latched once the panel has sent its `panel-client:ready` message. */
   loaded: boolean;
+  /**
+   * Host-bound payloads received before the panel's iframe document
+   * had a `message` listener attached. We buffer them until the
+   * panel posts `panel-client:ready` (which is what `@overlay-engine/
+   * client` sends after registering its window-message listener),
+   * then flush in order. Without this, any host-driven message that
+   * races iframe load is silently lost — `window.postMessage` to a
+   * window with no listener simply discards the event per HTML spec.
+   */
+  pendingMessages: unknown[];
 }
 
 type ChromeWebView = {
@@ -147,6 +157,7 @@ function createPanel(id: string, url: string, bounds: Rect, interactive: boolean
     zIndex,
     customRegions: null,
     loaded: false,
+    pendingMessages: [],
   });
   recomputeHitRegions();
 }
@@ -206,6 +217,16 @@ window.addEventListener("message", (ev) => {
     case "panel-client:ready":
       panel.loaded = true;
       postToHost({ v: PROTOCOL_VERSION, type: "panel:loaded", id: panel.id });
+      // Flush anything we buffered while the panel was loading. Order
+      // is preserved (FIFO) so the panel sees messages in the same
+      // sequence the host sent them.
+      if (panel.pendingMessages.length > 0) {
+        const drained = panel.pendingMessages;
+        panel.pendingMessages = [];
+        for (const payload of drained) {
+          deliverToPanel(panel, payload);
+        }
+      }
       break;
     case "panel-client:message":
       postToHost({
@@ -241,7 +262,25 @@ function findPanelBySource(source: MessageEventSource | null): PanelState | null
 
 function sendToPanel(id: string, payload: unknown): void {
   const panel = panels.get(id);
-  if (!panel || !panel.iframe.contentWindow) return;
+  if (!panel) return;
+  // Iframe load (and its panel-client subscribing to `message`
+  // events) is asynchronous, but the host has no way to know when
+  // an arbitrary panel becomes ready — `panel:create` resolves as
+  // soon as the engine accepts the request, well before the iframe
+  // document boots. Buffer any host-bound messages here and flush
+  // when `panel-client:ready` comes back, otherwise messages that
+  // race iframe load are silently dropped (the iframe's window has
+  // no `message` listener yet so the dispatched event has nowhere
+  // to go).
+  if (!panel.loaded) {
+    panel.pendingMessages.push(payload);
+    return;
+  }
+  deliverToPanel(panel, payload);
+}
+
+function deliverToPanel(panel: PanelState, payload: unknown): void {
+  if (!panel.iframe.contentWindow) return;
   const msg: ShellToPanel = {
     v: PROTOCOL_VERSION,
     type: "shell-client:message",

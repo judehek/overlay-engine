@@ -117,6 +117,7 @@ pub struct OverlayBuilder {
     dll_source: Option<DllSource>,
     static_dir: Option<PathBuf>,
     extra_router: Option<axum::Router>,
+    surface_size: Option<(u32, u32)>,
 }
 
 impl Default for OverlayBuilder {
@@ -125,6 +126,7 @@ impl Default for OverlayBuilder {
             dll_source: None,
             static_dir: None,
             extra_router: None,
+            surface_size: None,
         }
     }
 }
@@ -163,6 +165,18 @@ impl OverlayBuilder {
         self
     }
 
+    /// Override the WebView2 composition surface size in physical
+    /// pixels. The surface is stretched to cover the game window, so
+    /// pixel-coords on panels are scaled by `game_window / surface`.
+    /// Pick a size at or above the game's likely render resolution to
+    /// avoid blurring panels (default `800×600`, which is fine for
+    /// fixed-pixel HUD-style panels but undersized for full-screen
+    /// games at 1080p+).
+    pub fn surface_size(mut self, width: u32, height: u32) -> Self {
+        self.surface_size = Some((width, height));
+        self
+    }
+
     /// Start the asset server and return the configured `Overlay`.
     /// The server keeps running until the returned `Overlay` (and
     /// all its clones) is dropped.
@@ -183,6 +197,7 @@ impl OverlayBuilder {
                 asset_server,
                 state: AsyncMutex::new(OverlayState::Detached),
                 shell_ready: AtomicBool::new(false),
+                surface_size: self.surface_size,
             }),
         })
     }
@@ -207,10 +222,13 @@ impl Overlay {
             )));
         }
 
-        let config = crate::config::OverlayConfig::builder()
+        let mut config_builder = crate::config::OverlayConfig::builder()
             .dll_source(self.inner.dll_source.clone())
-            .url(self.inner.asset_server.shell_url().to_string())
-            .build()?;
+            .url(self.inner.asset_server.shell_url().to_string());
+        if let Some((w, h)) = self.inner.surface_size {
+            config_builder = config_builder.surface_size(w, h);
+        }
+        let config = config_builder.build()?;
 
         let (engine, engine_events) = OverlayEngine::attach(pid, config).await?;
 
@@ -385,6 +403,10 @@ pub(super) struct OverlayInner {
     /// outside the mutex so panel methods can decide between
     /// "send now" vs "queue" without serialising on the state lock.
     shell_ready: AtomicBool,
+    /// Override for the WebView2 composition surface size, captured
+    /// at builder time. `None` means the engine falls back to its
+    /// default ([`crate::config::DEFAULT_SURFACE_SIZE`]).
+    surface_size: Option<(u32, u32)>,
 }
 
 enum OverlayState {

@@ -23,10 +23,15 @@
         pointer-events: none;
       }
       .panel {
+        /* `fixed` so panel rects are positioned in viewport (= the
+           full WebView2 surface) coordinates regardless of any
+           future shell-level scrolling or layout. Iframe transparency
+           is governed by `color-scheme` matching between the shell
+           and the panel content (see panel HTMLs), not by the iframe
+           element's positioning model. */
         position: fixed;
         border: 0;
         background: transparent;
-        color-scheme: dark light;
       }
       .panel--interactive {
         pointer-events: auto;
