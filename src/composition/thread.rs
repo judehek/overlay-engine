@@ -68,6 +68,15 @@ pub(crate) struct WebThreadParams {
     /// `(width, height)` of the WebView2 composition surface. The
     /// staging texture and capture framepool are created at this size.
     pub surface_size: (u32, u32),
+    /// Scripts registered via `AddScriptToExecuteOnDocumentCreated`
+    /// before the initial `Navigate` call. Each script runs at the
+    /// start of every document the WebView2 loads, before the page's
+    /// own scripts. Empty by default.
+    pub document_created_scripts: Vec<String>,
+    /// Path WebView2 should use as its user-data folder (cookies,
+    /// local storage, cache). `None` lets WebView2 pick its
+    /// `<exe>.WebView2/EBWebView/` default.
+    pub user_data_folder: Option<String>,
 }
 
 /// Caller-side handle to a running WebView2 STA thread.
@@ -141,6 +150,8 @@ pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThrea
 
     let url = params.url;
     let surface_size = params.surface_size;
+    let document_created_scripts = params.document_created_scripts;
+    let user_data_folder = params.user_data_folder;
 
     let join_handle = thread::Builder::new()
         .name("overlay-engine-webview".into())
@@ -148,6 +159,8 @@ pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThrea
             if let Err(err) = web_thread_main(
                 url,
                 surface_size,
+                document_created_scripts,
+                user_data_folder,
                 frame_tx,
                 input_rx,
                 post_message_rx,
@@ -180,6 +193,8 @@ pub(crate) async fn spawn_web_thread(params: WebThreadParams) -> Result<WebThrea
 fn web_thread_main(
     url: String,
     surface_size: (u32, u32),
+    document_created_scripts: Vec<String>,
+    user_data_folder: Option<String>,
     frame_tx: tokio_mpsc::UnboundedSender<FrameUpdate>,
     input_rx: Receiver<InputEvent>,
     post_message_rx: Receiver<String>,
@@ -224,7 +239,7 @@ fn web_thread_main(
     let staging = d3d::StagingTexture::new(&d3d_device, width, height)?;
 
     // 5. WebView2 environment (blocking call; internally pumps messages).
-    let environment = webview::create_webview2_environment()?;
+    let environment = webview::create_webview2_environment(user_data_folder.as_deref())?;
 
     // 6. WebView2 composition controller.
     let composition_controller = webview::create_composition_controller(&environment, parent_hwnd)?;
@@ -340,6 +355,16 @@ fn web_thread_main(
 
     webview::register_web_message_handler(&webview, web_message_tx)
         .context("register_web_message_handler")?;
+
+    // Register any document-created scripts BEFORE Navigate so the
+    // very first document already has them attached. Scripts are
+    // processed in registration order — useful when a later script
+    // depends on host helpers a former one set up.
+    for script in &document_created_scripts {
+        webview::add_document_created_script(&webview, script)
+            .context("add_document_created_script")?;
+    }
+
     let url_wide = HSTRING::from(url.as_str());
     unsafe { webview.Navigate(&url_wide) }.context("Navigate failed")?;
 

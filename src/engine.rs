@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use asdf_overlay_client::{
     client::{IpcClientConn, IpcClientEventStream},
+    common::size::PercentLength,
     event::{
         input::{CursorEvent, CursorInput, InputEvent, InputPosition},
         OverlayEvent, WindowEvent,
@@ -19,7 +20,7 @@ use asdf_overlay_client::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::composition::{self, FrameUpdate, WebThreadHandle, WebThreadParams};
-use crate::config::{DllSource, OverlayConfig};
+use crate::config::{DllSource, OverlayConfig, SurfaceLayout};
 use crate::error::{Error, Result};
 use crate::event::{DetachReason, EngineEvent};
 use crate::hit_region::HitRegion;
@@ -84,6 +85,11 @@ impl OverlayEngine {
                 .clone()
                 .unwrap_or_else(|| "about:blank".to_string()),
             surface_size: config.surface_size,
+            document_created_scripts: config.document_created_scripts.clone(),
+            user_data_folder: config
+                .user_data_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
         })
         .await
         .map_err(Error::Composition)?;
@@ -91,7 +97,8 @@ impl OverlayEngine {
         let (window_id, game_window_size) =
             wait_for_first_window(&mut ipc_session.events, config.attach_timeout).await?;
 
-        ipc::configure_window_hover(&mut ipc_session.conn, window_id).await?;
+        ipc::configure_window_hover(&mut ipc_session.conn, window_id, config.surface_layout)
+            .await?;
 
         // OverlaySurface lives here on the engine side (its own internal
         // D3D11 device); the WebView2 thread hands us KMT handles, and
@@ -144,6 +151,47 @@ impl OverlayEngine {
     pub async fn navigate(&self, url: impl Into<String>) -> Result<()> {
         let _ = url.into();
         todo!("post a navigation request onto the WebView2 STA thread")
+    }
+
+    /// Re-position the overlay surface inside the game window.
+    ///
+    /// Sends `SetPosition` / `SetAnchor` / `SetMargin` to the
+    /// asdf-overlay DLL. The composition stack itself is unchanged
+    /// (no WebView2 / DXGI rebuild) — this just moves where the
+    /// existing texture is drawn on the game window.
+    pub async fn set_surface_layout(&self, layout: SurfaceLayout) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(EngineRequest::SetSurfaceLayout {
+                layout,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Error::AlreadyDetached)?;
+        reply_rx.await.map_err(|_| Error::AlreadyDetached)?
+    }
+
+    /// Push a new margin tuple to the asdf-overlay DLL without
+    /// re-sending `SetAnchor` / `SetPosition`.
+    ///
+    /// Equivalent to calling [`Self::set_surface_layout`] with the
+    /// current anchor/position and an updated margin, but ~3x faster
+    /// because only one IPC roundtrip is required instead of three.
+    /// Intended for per-frame drag updates where only the margin
+    /// (i.e. the user-facing offset) is changing.
+    pub async fn set_surface_margin(
+        &self,
+        margin: (PercentLength, PercentLength, PercentLength, PercentLength),
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(EngineRequest::SetSurfaceMargin {
+                margin,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Error::AlreadyDetached)?;
+        reply_rx.await.map_err(|_| Error::AlreadyDetached)?
     }
 
     /// Replace the currently-active set of [`HitRegion`]s.
@@ -218,6 +266,19 @@ impl OverlayEngine {
 enum EngineRequest {
     SetHitRegions {
         regions: Vec<HitRegion>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SetSurfaceLayout {
+        layout: SurfaceLayout,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Just push a new margin tuple to the DLL (`SetMargin`), without
+    /// the `SetAnchor` / `SetPosition` calls that
+    /// [`Self::SetSurfaceLayout`] also fires. Used by per-frame drag
+    /// updates where only the offset changes; cuts IPC roundtrip from
+    /// 3 calls to 1, ~3x faster end-to-end.
+    SetSurfaceMargin {
+        margin: (PercentLength, PercentLength, PercentLength, PercentLength),
         reply: oneshot::Sender<Result<()>>,
     },
     PostWebMessage {
@@ -384,6 +445,24 @@ async fn engine_loop(mut state: LoopState) {
                                 let _ = reply.send(Err(err));
                             }
                         }
+                    }
+                    EngineRequest::SetSurfaceLayout { layout, reply } => {
+                        let result = ipc::set_surface_layout(
+                            &mut state.conn,
+                            state.window_id,
+                            layout,
+                        )
+                        .await;
+                        let _ = reply.send(result);
+                    }
+                    EngineRequest::SetSurfaceMargin { margin, reply } => {
+                        let result = ipc::set_surface_margin(
+                            &mut state.conn,
+                            state.window_id,
+                            margin,
+                        )
+                        .await;
+                        let _ = reply.send(result);
                     }
                     EngineRequest::PostWebMessage { text, reply } => {
                         match state.web.post_message_tx.send(text) {

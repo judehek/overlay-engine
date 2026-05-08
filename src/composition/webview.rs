@@ -13,7 +13,8 @@ use std::sync::mpsc::channel;
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc as tokio_mpsc;
 use webview2_com::{
-    take_pwstr, CreateCoreWebView2CompositionControllerCompletedHandler,
+    take_pwstr, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2CompositionController,
@@ -21,22 +22,40 @@ use webview2_com::{
     },
     WebMessageReceivedEventHandler,
 };
-use windows::core::{Interface, PCWSTR, PWSTR};
+use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::HWND;
 
 /// Block on environment creation; returns the environment once ready.
+///
+/// `user_data_folder` is the path WebView2 stores cookies / local
+/// storage / cache under. Pass `None` to let WebView2 pick its
+/// `<exe>.WebView2/EBWebView/` default; pass `Some(path)` to share a
+/// cookie jar with another WebView2 instance (e.g. a Tauri main
+/// window that's signing the user into Instagram so the in-game
+/// overlay sees the same session).
 ///
 /// Uses an `mpsc::channel` to carry the result out of the completion
 /// callback — the callback is stored in a `Box<dyn FnOnce + 'static>`,
 /// so any local we capture by `&mut` would have to be `'static` too. A
 /// `Sender` is `'static + Send` and has no such issue.
-pub(crate) fn create_webview2_environment() -> Result<ICoreWebView2Environment> {
+pub(crate) fn create_webview2_environment(
+    user_data_folder: Option<&str>,
+) -> Result<ICoreWebView2Environment> {
+    // Hold the wide-string buffer alive across the async call. PCWSTR
+    // is just a borrowed pointer, so the HSTRING owning the bytes has
+    // to outlive `wait_for_async_operation` — capture it by move into
+    // the kickoff closure rather than computing the pointer outside.
+    let user_data_wide = user_data_folder.map(HSTRING::from);
     let (tx, rx) = channel::<Result<ICoreWebView2Environment>>();
     CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
-        Box::new(|handler| unsafe {
+        Box::new(move |handler| unsafe {
+            let user_data_ptr = user_data_wide
+                .as_ref()
+                .map(|s| PCWSTR::from_raw(s.as_ptr()))
+                .unwrap_or_else(PCWSTR::null);
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
-                PCWSTR::null(),
+                user_data_ptr,
                 None,
                 &handler,
             )
@@ -118,4 +137,48 @@ pub(crate) fn register_web_message_handler(
     unsafe { webview.add_WebMessageReceived(&handler, &mut token) }
         .context("add_WebMessageReceived")?;
     Ok(())
+}
+
+/// Register a script that the WebView2 runs at "document created" time
+/// for **every** navigation, before any of the page's own scripts run.
+///
+/// We use this to inject a host-controlled UI layer (e.g. a draggable
+/// frame around the panel content) without relying on the embedded
+/// shell page — top-frame navigation would replace the shell, but a
+/// document-created script survives because it's hung off the WebView2
+/// runtime, not the document.
+///
+/// Blocks the current STA thread until the underlying COM async
+/// operation completes, same pattern as the other helpers in this
+/// module. Safe to call multiple times to register multiple scripts.
+pub(crate) fn add_document_created_script(
+    webview: &ICoreWebView2,
+    script: &str,
+) -> Result<()> {
+    // COM interface is refcounted — clone so the `wait_for_async_operation`
+    // closure is `'static` (it cannot capture a `&ICoreWebView2`).
+    let webview = webview.clone();
+    let script_wide = HSTRING::from(script);
+    let (tx, rx) = channel::<Result<()>>();
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| unsafe {
+            webview
+                .AddScriptToExecuteOnDocumentCreated(PCWSTR::from_raw(script_wide.as_ptr()), &handler)
+                .map_err(Into::into)
+        }),
+        Box::new(move |hr, _id| {
+            let r = if hr.is_ok() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "AddScriptToExecuteOnDocumentCreated failed: {hr:?}"
+                ))
+            };
+            let _ = tx.send(r);
+            Ok(())
+        }),
+    )
+    .map_err(|e| anyhow!("wait_for_async_operation (add script): {e:?}"))?;
+    rx.recv()
+        .map_err(|_| anyhow!("add-script handler never fired"))?
 }

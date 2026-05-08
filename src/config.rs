@@ -7,12 +7,61 @@
 
 use std::path::{Path, PathBuf};
 
+use asdf_overlay_client::common::size::PercentLength;
+
 use crate::error::{Error, Result};
 use crate::{InjectStrategy, OverlayDll};
 
 /// Default render-surface size used when the caller doesn't override it. The
 /// engine recreates the WebView2 surface at this size on attach.
 pub const DEFAULT_SURFACE_SIZE: (u32, u32) = (800, 600);
+
+/// Where the overlay surface gets composited inside the target game
+/// window. Mirrors `asdf-overlay`'s layout primitives directly:
+///
+/// * `position`  — point inside the game window, relative to its
+///   client area, that the surface anchor maps onto.
+/// * `anchor`    — point inside the surface texture (relative to the
+///   surface's own size) that lands on `position`.
+/// * `margin`    — `(top, right, bottom, left)` padding folded into
+///   the layout calculation.
+///
+/// All four are [`PercentLength`]s so callers can mix percent-of-
+/// container with absolute pixels in the same expression.
+///
+/// The default layout (everything zero) anchors the top-left of the
+/// surface at the top-left of the game window, which is what every
+/// existing call site assumed before this knob was exposed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceLayout {
+    pub position: (PercentLength, PercentLength),
+    pub anchor: (PercentLength, PercentLength),
+    pub margin: (PercentLength, PercentLength, PercentLength, PercentLength),
+}
+
+impl SurfaceLayout {
+    /// All-zero layout: surface drawn at the top-left of the game
+    /// window at native size. Matches the engine's pre-`SurfaceLayout`
+    /// behaviour.
+    pub const fn top_left() -> Self {
+        Self {
+            position: (PercentLength::ZERO, PercentLength::ZERO),
+            anchor: (PercentLength::ZERO, PercentLength::ZERO),
+            margin: (
+                PercentLength::ZERO,
+                PercentLength::ZERO,
+                PercentLength::ZERO,
+                PercentLength::ZERO,
+            ),
+        }
+    }
+}
+
+impl Default for SurfaceLayout {
+    fn default() -> Self {
+        Self::top_left()
+    }
+}
 
 /// How the engine should locate the `asdf-overlay` DLL to inject.
 ///
@@ -45,6 +94,11 @@ pub struct OverlayConfig {
     /// Overlay surface size in physical pixels.
     pub(crate) surface_size: (u32, u32),
 
+    /// Where in the game window the overlay surface gets drawn. The
+    /// engine sends this as `SetPosition` / `SetAnchor` / `SetMargin`
+    /// to the asdf-overlay DLL during attach.
+    pub(crate) surface_layout: SurfaceLayout,
+
     /// Which DLL injection strategy to use. Defaults to
     /// [`InjectStrategy::WindowsHook`] -- the only strategy known to work
     /// with kernel anti-cheats (Vanguard) when the DLL is properly signed.
@@ -54,6 +108,19 @@ pub struct OverlayConfig {
     /// `SetWindowsHookEx` path to confirm the DLL has loaded into the
     /// target.
     pub(crate) attach_timeout: std::time::Duration,
+
+    /// JavaScript snippets injected via
+    /// `AddScriptToExecuteOnDocumentCreated`. Each script runs at the
+    /// start of every document the WebView2 loads, before the page's
+    /// own scripts. Useful for a host-controlled UI layer (e.g. a
+    /// draggable frame) that needs to survive top-frame navigations
+    /// away from the embedded shell page.
+    pub(crate) document_created_scripts: Vec<String>,
+
+    /// Filesystem path WebView2 uses for its user-data folder
+    /// (cookies, local storage, cache). `None` lets WebView2 pick
+    /// `<exe>.WebView2/EBWebView/` next to the host process.
+    pub(crate) user_data_folder: Option<PathBuf>,
 }
 
 impl OverlayConfig {
@@ -74,12 +141,24 @@ impl OverlayConfig {
         self.surface_size
     }
 
+    pub fn surface_layout(&self) -> SurfaceLayout {
+        self.surface_layout
+    }
+
     pub fn inject_strategy(&self) -> InjectStrategy {
         self.inject_strategy
     }
 
     pub fn attach_timeout(&self) -> std::time::Duration {
         self.attach_timeout
+    }
+
+    pub fn document_created_scripts(&self) -> &[String] {
+        &self.document_created_scripts
+    }
+
+    pub fn user_data_folder(&self) -> Option<&Path> {
+        self.user_data_folder.as_deref()
     }
 }
 
@@ -90,8 +169,11 @@ pub struct OverlayConfigBuilder {
     dll_source: Option<DllSource>,
     initial_url: Option<String>,
     surface_size: Option<(u32, u32)>,
+    surface_layout: Option<SurfaceLayout>,
     inject_strategy: Option<InjectStrategy>,
     attach_timeout: Option<std::time::Duration>,
+    document_created_scripts: Vec<String>,
+    user_data_folder: Option<PathBuf>,
 }
 
 impl OverlayConfigBuilder {
@@ -137,6 +219,15 @@ impl OverlayConfigBuilder {
         self
     }
 
+    /// Optional: override the default top-left surface layout. Use
+    /// this to anchor a smaller-than-full-window surface in any
+    /// corner / center of the game window. See [`SurfaceLayout`] for
+    /// the exact composition rules (they mirror asdf-overlay's).
+    pub fn surface_layout(mut self, layout: SurfaceLayout) -> Self {
+        self.surface_layout = Some(layout);
+        self
+    }
+
     /// Optional: override the injection strategy. The default is the only
     /// one known to be safe against modern kernel anti-cheats; only change
     /// this if you know what you're doing.
@@ -148,6 +239,24 @@ impl OverlayConfigBuilder {
     /// Optional: how long to wait on the safe-inject path before giving up.
     pub fn attach_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.attach_timeout = Some(timeout);
+        self
+    }
+
+    /// Append a JavaScript snippet that runs at the start of **every**
+    /// document the WebView2 loads (via
+    /// `AddScriptToExecuteOnDocumentCreated`). Call multiple times to
+    /// register multiple scripts; they're executed in registration
+    /// order. Useful for a host-controlled UI layer that needs to
+    /// survive top-frame navigations away from the embedded shell.
+    pub fn document_created_script(mut self, script: impl Into<String>) -> Self {
+        self.document_created_scripts.push(script.into());
+        self
+    }
+
+    /// Override the WebView2 user-data folder for the env this engine
+    /// will create.
+    pub fn user_data_folder(mut self, path: impl Into<PathBuf>) -> Self {
+        self.user_data_folder = Some(path.into());
         self
     }
 
@@ -173,10 +282,13 @@ impl OverlayConfigBuilder {
             dll_source,
             initial_url: self.initial_url,
             surface_size: self.surface_size.unwrap_or(DEFAULT_SURFACE_SIZE),
+            surface_layout: self.surface_layout.unwrap_or_default(),
             inject_strategy: self.inject_strategy.unwrap_or(InjectStrategy::WindowsHook),
             attach_timeout: self
                 .attach_timeout
                 .unwrap_or_else(|| std::time::Duration::from_secs(15)),
+            document_created_scripts: self.document_created_scripts,
+            user_data_folder: self.user_data_folder,
         })
     }
 }

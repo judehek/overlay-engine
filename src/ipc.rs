@@ -25,12 +25,15 @@ use asdf_overlay_client::{
     common::{
         ipc::create_ipc_addr,
         request::{
-            BlockCursorInOverlay, ListenInput, SetAnchor, SetPosition, UpdateSharedHandle,
+            BlockCursorInOverlay, ListenInput, SetAnchor, SetMargin, SetPosition,
+            UpdateSharedHandle,
         },
         size::PercentLength,
     },
     inject_only_with, HookGuard, InjectStrategy, InjectionResult, OverlayDll,
 };
+
+use crate::config::SurfaceLayout;
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::{sleep, timeout};
 
@@ -132,8 +135,11 @@ async fn wait_for_pipe(
 
 /// Configure a game window for hover-mode interaction:
 ///
-/// * Anchor + position at the top-left so the WebView2 surface coords
-///   match the game-window client coords directly.
+/// * Anchor / position / margin from the engine's `SurfaceLayout` so
+///   the WebView2 texture lands where the consumer wants on the game
+///   window. The default layout is top-left at native size, which is
+///   what every existing call site assumed before the layout knob
+///   was exposed.
 /// * Cursor + keyboard input listening on so the engine sees every
 ///   event the wndproc / queue filter sees.
 /// * `BlockCursorInOverlay` left **off** initially — the DLL only
@@ -145,22 +151,13 @@ async fn wait_for_pipe(
 ///   in lockstep with `set_hit_regions`: empty regions ⇒ off (game
 ///   gets every input), non-empty ⇒ on (so the WebView2 panel can
 ///   actually receive the click).
-pub(crate) async fn configure_window_hover(conn: &mut IpcClientConn, id: u32) -> Result<()> {
+pub(crate) async fn configure_window_hover(
+    conn: &mut IpcClientConn,
+    id: u32,
+    layout: SurfaceLayout,
+) -> Result<()> {
+    set_surface_layout(conn, id, layout).await?;
     let mut window = conn.window(id);
-    window
-        .request(SetAnchor {
-            x: PercentLength::Length(0.0),
-            y: PercentLength::Length(0.0),
-        })
-        .await
-        .map_err(Error::Ipc)?;
-    window
-        .request(SetPosition {
-            x: PercentLength::Length(0.0),
-            y: PercentLength::Length(0.0),
-        })
-        .await
-        .map_err(Error::Ipc)?;
     window
         .request(ListenInput {
             cursor: true,
@@ -176,6 +173,65 @@ pub(crate) async fn configure_window_hover(conn: &mut IpcClientConn, id: u32) ->
         .map_err(Error::Ipc)?;
     window
         .request(BlockCursorInOverlay { enabled: false })
+        .await
+        .map_err(Error::Ipc)?;
+    Ok(())
+}
+
+/// Push just the position / anchor / margin triple to the asdf-overlay
+/// DLL. Used both at attach time (via [`configure_window_hover`]) and
+/// at runtime from the engine loop when the consumer calls
+/// `OverlayEngine::set_surface_layout`.
+pub(crate) async fn set_surface_layout(
+    conn: &mut IpcClientConn,
+    id: u32,
+    layout: SurfaceLayout,
+) -> Result<()> {
+    let mut window = conn.window(id);
+    window
+        .request(SetAnchor {
+            x: layout.anchor.0,
+            y: layout.anchor.1,
+        })
+        .await
+        .map_err(Error::Ipc)?;
+    window
+        .request(SetPosition {
+            x: layout.position.0,
+            y: layout.position.1,
+        })
+        .await
+        .map_err(Error::Ipc)?;
+    window
+        .request(SetMargin {
+            top: layout.margin.0,
+            right: layout.margin.1,
+            bottom: layout.margin.2,
+            left: layout.margin.3,
+        })
+        .await
+        .map_err(Error::Ipc)?;
+    Ok(())
+}
+
+/// Push only `SetMargin` to the DLL. The fast path used by
+/// `OverlayEngine::set_surface_margin` for per-frame drag updates,
+/// where the anchor and position never change but the margin
+/// (= the user-facing offset) does. Roughly 3x cheaper than the
+/// full `set_surface_layout` triple, which matters at 120 Hz drag
+/// event rates.
+pub(crate) async fn set_surface_margin(
+    conn: &mut IpcClientConn,
+    id: u32,
+    margin: (PercentLength, PercentLength, PercentLength, PercentLength),
+) -> Result<()> {
+    conn.window(id)
+        .request(SetMargin {
+            top: margin.0,
+            right: margin.1,
+            bottom: margin.2,
+            left: margin.3,
+        })
         .await
         .map_err(Error::Ipc)?;
     Ok(())

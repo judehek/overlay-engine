@@ -74,7 +74,7 @@ mod input;
 #[cfg(target_os = "windows")]
 mod ipc;
 
-pub use config::{DllSource, OverlayConfig, OverlayConfigBuilder};
+pub use config::{DllSource, OverlayConfig, OverlayConfigBuilder, SurfaceLayout};
 pub use engine::OverlayEngine;
 pub use error::{Error, Result};
 pub use event::{DetachReason, EngineEvent, NavigationStatus};
@@ -83,4 +83,5 @@ pub use overlay::{Overlay, OverlayBuilder, OverlayEvent, Panel, PanelOptions, Re
 
 // Re-export the asdf-overlay types we expose in our public surface so
 // consumers don't have to add asdf-overlay-client as a direct dep.
+pub use asdf_overlay_client::common::size::PercentLength;
 pub use asdf_overlay_client::{InjectStrategy, OverlayDll};

@@ -362,15 +362,16 @@ fn dispatch_cursor(
             // `mouseData` for wheel events is a signed 16-bit scroll
             // delta, conventionally a multiple of `WHEEL_DELTA` (120).
             //
-            // Sign semantics differ between asdf-overlay and Windows: the
-            // enum doc says "positive = down/right", matching Win32's
-            // horizontal wheel but inverted vs. Win32's vertical wheel
-            // (where positive = up). Flip the Y axis sign to match
-            // WM_MOUSEWHEEL convention that WebView2 expects.
-            let signed_delta: i32 = match axis {
-                ScrollAxis::Y => -i32::from(*delta),
-                ScrollAxis::X => i32::from(*delta),
-            };
+            // asdf-overlay's `Scroll` doc claims "positive = down/right",
+            // but the DLL's WM_MOUSEWHEEL handler actually forwards the
+            // raw Win32 wparam delta unmodified - and Win32's vertical
+            // wheel uses "positive = wheel forward = scroll-up intent".
+            // Empirically the DLL behaviour is what matters (WebView2
+            // also follows Win32 convention), so pass the delta through
+            // unmodified on both axes. A previous version of this match
+            // negated the Y axis to "honour the docstring", which
+            // produced double-inverted scroll in WebView2.
+            let signed_delta: i32 = i32::from(*delta);
             let mouse_data = signed_delta as u32;
             let kind = match axis {
                 ScrollAxis::Y => COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,

@@ -57,7 +57,7 @@ pub mod protocol;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::Serialize;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -118,6 +118,9 @@ pub struct OverlayBuilder {
     static_dir: Option<PathBuf>,
     extra_router: Option<axum::Router>,
     surface_size: Option<(u32, u32)>,
+    surface_layout: Option<crate::config::SurfaceLayout>,
+    document_created_scripts: Vec<String>,
+    user_data_folder: Option<PathBuf>,
 }
 
 impl Default for OverlayBuilder {
@@ -127,6 +130,9 @@ impl Default for OverlayBuilder {
             static_dir: None,
             extra_router: None,
             surface_size: None,
+            surface_layout: None,
+            document_created_scripts: Vec::new(),
+            user_data_folder: None,
         }
     }
 }
@@ -177,6 +183,40 @@ impl OverlayBuilder {
         self
     }
 
+    /// Override where the overlay surface is composited inside the
+    /// game window. The default ([`SurfaceLayout::top_left`]) draws
+    /// the surface at the top-left corner at native size, which is
+    /// the right answer when `surface_size` covers the full game
+    /// window. For sub-window panels (e.g. a phone-shaped HUD on
+    /// the right side) tweak this to anchor / position the surface
+    /// where you want it.
+    ///
+    /// [`SurfaceLayout`]: crate::SurfaceLayout
+    /// [`SurfaceLayout::top_left`]: crate::SurfaceLayout::top_left
+    pub fn surface_layout(mut self, layout: crate::config::SurfaceLayout) -> Self {
+        self.surface_layout = Some(layout);
+        self
+    }
+
+    /// Append a JavaScript snippet that runs at the start of every
+    /// document the WebView2 loads (via
+    /// `AddScriptToExecuteOnDocumentCreated`). Call multiple times
+    /// to register multiple scripts; they're executed in
+    /// registration order. Useful for a host-controlled UI layer
+    /// that needs to survive top-frame navigations away from the
+    /// embedded shell.
+    pub fn document_created_script(mut self, script: impl Into<String>) -> Self {
+        self.document_created_scripts.push(script.into());
+        self
+    }
+
+    /// Override the WebView2 user-data folder for the env this overlay
+    /// will create.
+    pub fn user_data_folder(mut self, path: impl Into<PathBuf>) -> Self {
+        self.user_data_folder = Some(path.into());
+        self
+    }
+
     /// Start the asset server and return the configured `Overlay`.
     /// The server keeps running until the returned `Overlay` (and
     /// all its clones) is dropped.
@@ -197,7 +237,10 @@ impl OverlayBuilder {
                 asset_server,
                 state: AsyncMutex::new(OverlayState::Detached),
                 shell_ready: AtomicBool::new(false),
-                surface_size: self.surface_size,
+                surface_size: StdMutex::new(self.surface_size),
+                surface_layout: StdMutex::new(self.surface_layout),
+                document_created_scripts: self.document_created_scripts,
+                user_data_folder: self.user_data_folder,
             }),
         })
     }
@@ -225,8 +268,27 @@ impl Overlay {
         let mut config_builder = crate::config::OverlayConfig::builder()
             .dll_source(self.inner.dll_source.clone())
             .url(self.inner.asset_server.shell_url().to_string());
-        if let Some((w, h)) = self.inner.surface_size {
+        let surface_size = *self
+            .inner
+            .surface_size
+            .lock()
+            .expect("Overlay::surface_size mutex poisoned");
+        let surface_layout = *self
+            .inner
+            .surface_layout
+            .lock()
+            .expect("Overlay::surface_layout mutex poisoned");
+        if let Some((w, h)) = surface_size {
             config_builder = config_builder.surface_size(w, h);
+        }
+        if let Some(layout) = surface_layout {
+            config_builder = config_builder.surface_layout(layout);
+        }
+        for script in &self.inner.document_created_scripts {
+            config_builder = config_builder.document_created_script(script.clone());
+        }
+        if let Some(path) = &self.inner.user_data_folder {
+            config_builder = config_builder.user_data_folder(path.clone());
         }
         let config = config_builder.build()?;
 
@@ -295,6 +357,93 @@ impl Overlay {
             inner: Arc::clone(&self.inner),
             id: options.id,
         })
+    }
+
+    /// Update the WebView2 composition surface size used on the
+    /// **next** [`Self::attach`]. The current attach (if any) is not
+    /// affected — surface size is baked into the WebView2 + DXGI
+    /// stack at attach time, so resizing live would require tearing
+    /// down and rebuilding the composition stack. Callers wanting an
+    /// immediate effect should follow this with a `detach` /
+    /// `attach` cycle.
+    pub fn set_surface_size(&self, width: u32, height: u32) {
+        *self
+            .inner
+            .surface_size
+            .lock()
+            .expect("Overlay::surface_size mutex poisoned") = Some((width, height));
+    }
+
+    /// Update where the overlay surface is composited inside the
+    /// game window. If currently attached, the new layout is pushed
+    /// to the asdf-overlay DLL via IPC immediately (the DLL just
+    /// re-reads `SetPosition` / `SetAnchor` / `SetMargin`, no
+    /// composition rebuild needed). Either way the new layout is
+    /// also remembered for the next attach.
+    pub async fn set_surface_layout(&self, layout: crate::config::SurfaceLayout) -> Result<()> {
+        *self
+            .inner
+            .surface_layout
+            .lock()
+            .expect("Overlay::surface_layout mutex poisoned") = Some(layout);
+        let engine = {
+            let state = self.inner.state.lock().await;
+            match &*state {
+                OverlayState::Detached => None,
+                OverlayState::Attached(a) => Some(a.engine.clone()),
+            }
+        };
+        if let Some(engine) = engine {
+            engine.set_surface_layout(layout).await?;
+        }
+        Ok(())
+    }
+
+    /// Margin-only fast path. Updates the cached layout's margin (so
+    /// the next attach uses the new value) and pushes only `SetMargin`
+    /// to the DLL when currently attached. Anchor/position must be
+    /// already-set; if the cached layout is `None` this falls through
+    /// to a full layout push using
+    /// [`crate::config::SurfaceLayout::default`] for anchor/position.
+    pub async fn set_surface_margin(
+        &self,
+        margin: (
+            crate::PercentLength,
+            crate::PercentLength,
+            crate::PercentLength,
+            crate::PercentLength,
+        ),
+    ) -> Result<()> {
+        // Update the cached layout's margin so a subsequent re-attach
+        // doesn't lose this update.
+        {
+            let mut cached = self
+                .inner
+                .surface_layout
+                .lock()
+                .expect("Overlay::surface_layout mutex poisoned");
+            if let Some(ref mut layout) = *cached {
+                layout.margin = margin;
+            } else {
+                // No cached layout - we still don't have anchor/position
+                // information, so promote this to a full layout push
+                // using the engine default for anchor/position.
+                let mut layout = crate::config::SurfaceLayout::default();
+                layout.margin = margin;
+                *cached = Some(layout);
+            }
+        }
+        let engine = {
+            let state = self.inner.state.lock().await;
+            match &*state {
+                OverlayState::Detached => None,
+                OverlayState::Attached(a) => Some(a.engine.clone()),
+            }
+        };
+        if let Some(engine) = engine {
+            engine.set_surface_margin(margin).await?;
+        }
+        Ok(())
     }
 
     /// Tear down the overlay. Detaches the engine, drops the
@@ -404,9 +553,26 @@ pub(super) struct OverlayInner {
     /// "send now" vs "queue" without serialising on the state lock.
     shell_ready: AtomicBool,
     /// Override for the WebView2 composition surface size, captured
-    /// at builder time. `None` means the engine falls back to its
-    /// default ([`crate::config::DEFAULT_SURFACE_SIZE`]).
-    surface_size: Option<(u32, u32)>,
+    /// at builder time and mutable at runtime via
+    /// [`Overlay::set_surface_size`]. `None` means the engine falls
+    /// back to its default ([`crate::config::DEFAULT_SURFACE_SIZE`]).
+    /// Reads on each [`Overlay::attach`] so mutations take effect on
+    /// the next attach without rebuilding the [`Overlay`].
+    surface_size: StdMutex<Option<(u32, u32)>>,
+    /// Override for where the surface is composited inside the game
+    /// window. `None` means the engine falls back to top-left at
+    /// native size ([`crate::config::SurfaceLayout::top_left`]). Same
+    /// mutability semantics as [`Self::surface_size`]; updates are
+    /// also pushed to the engine via IPC if currently attached.
+    surface_layout: StdMutex<Option<crate::config::SurfaceLayout>>,
+    /// JavaScript snippets registered with WebView2 via
+    /// `AddScriptToExecuteOnDocumentCreated` on every attach. Same
+    /// snapshot is used across attaches; not mutable today (changes
+    /// would only matter for the next attach anyway).
+    document_created_scripts: Vec<String>,
+    /// Optional override for WebView2's user-data folder. See
+    /// [`OverlayBuilder::user_data_folder`].
+    user_data_folder: Option<PathBuf>,
 }
 
 enum OverlayState {

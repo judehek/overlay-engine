@@ -141,6 +141,29 @@ function createPanel(id: string, url: string, bounds: Rect, interactive: boolean
     });
     return;
   }
+  // Top-frame escape hatch. URLs prefixed with `topframe:` are
+  // navigated as the WebView's top-level document instead of being
+  // mounted as an iframe — this is the only way to render sites
+  // that ship `X-Frame-Options: DENY` or `Content-Security-Policy:
+  // frame-ancestors` (Instagram, Twitter, etc.). After this point
+  // the shell is gone, so subsequent host messages (panel:create,
+  // panel:close, hit-region updates) won't reach anything; the host
+  // is expected to detach the engine entirely to tear the panel
+  // down and re-attach to show a different one. Before navigating
+  // we tell the host the full surface is interactive so clicks /
+  // scrolls reach the new top-frame document instead of falling
+  // through to the game.
+  if (url.startsWith("topframe:")) {
+    const realUrl = url.slice("topframe:".length);
+    postToHost({
+      v: PROTOCOL_VERSION,
+      type: "shell:hit-regions",
+      regions: [{ x: 0, y: 0, w: window.innerWidth, h: window.innerHeight }],
+    });
+    postToHost({ v: PROTOCOL_VERSION, type: "panel:loaded", id });
+    window.location.href = realUrl;
+    return;
+  }
   const iframe = document.createElement("iframe");
   iframe.className = `panel${interactive ? " panel--interactive" : ""}`;
   iframe.dataset.panelId = id;
