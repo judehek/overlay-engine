@@ -169,6 +169,29 @@ function createPanel(id: string, url: string, bounds: Rect, interactive: boolean
   iframe.dataset.panelId = id;
   iframe.allow = "autoplay; fullscreen; clipboard-read; clipboard-write";
   applyBounds(iframe, bounds, zIndex);
+  // Diagnostic: surface iframe element-level load lifecycle through the
+  // existing panel:error channel. The "[iframe-diag]" prefix lets the
+  // host grep these out from real panel errors. A `load` event fires
+  // for every navigation including error pages, so an absence of this
+  // log alongside a missing panel:loaded indicates the iframe never
+  // even fired a navigation completion (most likely an AV/firewall
+  // blocking the loopback fetch from inside the game process).
+  iframe.addEventListener("load", () => {
+    postToHost({
+      v: PROTOCOL_VERSION,
+      type: "panel:error",
+      id,
+      error: `[iframe-diag] load fired for ${url}`,
+    });
+  });
+  iframe.addEventListener("error", (ev) => {
+    postToHost({
+      v: PROTOCOL_VERSION,
+      type: "panel:error",
+      id,
+      error: `[iframe-diag] error event: ${(ev as ErrorEvent).message ?? "unknown"} for ${url}`,
+    });
+  });
   iframe.src = url;
   document.body.appendChild(iframe);
 
