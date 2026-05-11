@@ -14,11 +14,12 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc as tokio_mpsc;
 use webview2_com::{
     take_pwstr, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CoreWebView2EnvironmentOptions,
     CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2CompositionController,
-        ICoreWebView2Environment, ICoreWebView2Environment3,
+        ICoreWebView2Environment, ICoreWebView2Environment3, ICoreWebView2EnvironmentOptions,
     },
     WebMessageReceivedEventHandler,
 };
@@ -46,6 +47,30 @@ pub(crate) fn create_webview2_environment(
     // to outlive `wait_for_async_operation` — capture it by move into
     // the kickoff closure rather than computing the pointer outside.
     let user_data_wide = user_data_folder.map(HSTRING::from);
+
+    // Defeat Chromium site isolation for in-process iframes. WebView2's
+    // default Chromium configuration can composite cross-context iframes
+    // onto out-of-process SurfaceLayer surfaces, which on some user
+    // configurations don't honour the controller's
+    // `SetDefaultBackgroundColor(A=0)` setting — the iframe sub-surface
+    // renders with its built-in opaque-white default while the
+    // shell-document area is correctly transparent. That asymmetry
+    // matches the field reports of a "white box" exactly over panel
+    // bounds while game pixels are visible everywhere else. Disabling
+    // these features pulls iframe rendering back into the main
+    // compositor where the alpha-0 default takes effect uniformly. The
+    // performance cost is irrelevant for a single overlay surface
+    // hosting two small panels.
+    let options: ICoreWebView2EnvironmentOptions = {
+        let raw = CoreWebView2EnvironmentOptions::default();
+        unsafe {
+            raw.set_additional_browser_arguments(
+                "--disable-features=IsolateOrigins,site-per-process,SitePerProcess".to_string(),
+            );
+        }
+        raw.into()
+    };
+
     let (tx, rx) = channel::<Result<ICoreWebView2Environment>>();
     CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
         Box::new(move |handler| unsafe {
@@ -56,7 +81,7 @@ pub(crate) fn create_webview2_environment(
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
                 user_data_ptr,
-                None,
+                &options,
                 &handler,
             )
             .map_err(Into::into)
