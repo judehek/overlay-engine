@@ -177,11 +177,33 @@ function createPanel(id: string, url: string, bounds: Rect, interactive: boolean
   // even fired a navigation completion (most likely an AV/firewall
   // blocking the loopback fetch from inside the game process).
   iframe.addEventListener("load", () => {
+    // Probe the iframe content to distinguish "our HTML loaded" from
+    // "Chromium rendered an error page." Error pages live on
+    // chrome-error://chromewebdata/ — a different origin from the
+    // shell — so any contentDocument access throws SecurityError.
+    // If accessible, we surface title/URL/#app presence to confirm
+    // it's actually game-notification.html.
+    let info = `load fired for ${url}`;
+    try {
+      const doc = iframe.contentDocument;
+      if (!doc) {
+        info += " | contentDocument=null (likely cross-origin error page)";
+      } else {
+        const title = doc.title ?? "";
+        const docUrl = doc.URL ?? "";
+        const appPresent = !!doc.getElementById("app");
+        const scripts = doc.querySelectorAll("script").length;
+        const bodyText = (doc.body?.textContent ?? "").trim().slice(0, 120);
+        info += ` | title="${title}" url=${docUrl} appDiv=${appPresent} scripts=${scripts} bodyTextSample="${bodyText}"`;
+      }
+    } catch (e) {
+      info += ` | contentDocument access threw: ${(e as Error).message ?? e}`;
+    }
     postToHost({
       v: PROTOCOL_VERSION,
       type: "panel:error",
       id,
-      error: `[iframe-diag] load fired for ${url}`,
+      error: `[iframe-diag] ${info}`,
     });
   });
   iframe.addEventListener("error", (ev) => {
