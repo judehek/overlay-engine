@@ -10,7 +10,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostQuitMessage, RegisterClassW, CW_USEDEFAULT,
-    WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_OVERLAPPED,
+    WM_CLOSE, WM_DESTROY, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 const HOST_CLASS: &str = "OverlayEngineWebViewHost\0";
@@ -40,7 +40,16 @@ pub(crate) fn create_host_window() -> Result<HWND> {
 
     let hwnd = unsafe {
         CreateWindowExW(
-            Default::default(),
+            // WS_EX_TOOLWINDOW excludes the window from the taskbar and
+            // the Alt+Tab switcher. Without it, the host HWND — which is
+            // a real top-level window with a title — gets a taskbar
+            // entry and a live-preview thumbnail on hover, even though
+            // we never call ShowWindow on it. Some users hover/Alt-Tab
+            // through it and see a ghost "overlay-engine shell" window
+            // hanging over their desktop with whatever the panel surface
+            // currently renders. A tool window is invisible to that
+            // tasklist code path entirely.
+            WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
             windows::core::w!("overlay-engine-webview-host"),
             WS_OVERLAPPED,
